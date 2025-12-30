@@ -1,35 +1,12 @@
-<#
-.SYNOPSIS
-    Einfach: Wenn ein Volume mit dem angegebenen Label vorhanden ist, werden zwei feste Launcher gestartet.
-.DESCRIPTION
-    Polling-Loop mit Timeout: sobald das Volume gefunden wird, werden die fest konfigurierten Launcher
-    (absolute Pfade auf C:\) gestartet.
-
-TASK SCHEDULER HINWEISE
-    Empfohlene Einstellungen für den Windows Task Scheduler (wenn GUI-Prozesse gestartet werden sollen):
-      - Trigger: At startup / On workstation unlock / On an event (oder nach Bedarf)
-      - Run only when user is logged on (ermöglicht interaktives Starten der GUI-Anwendungen)
-      - Run with highest privileges
-      - Configure for: Windows 10/11
-
-    Schtasks-Beispiel (interaktiv, führt das Skript bei Systemstart aus, ersetzt <User> mit deinem Account):
-      schtasks.exe /Create /TN "GameDriveLauncher" /TR "powershell.exe -ExecutionPolicy Bypass -File ""C:\\path\\to\\GameDrive.ps1""" /SC ONSTART /RL HIGHEST /IT /F /RU "<User>"
-
-    Hinweis: /IT sorgt dafür, dass die Aufgabe interaktiv läuft (nur möglich, wenn ein Benutzer angegeben ist
-    und "Run only when user is logged on" verwendet wird). Falls du den Task als Hintergrunddienst (nicht-interaktiv)
-    laufen lassen willst, entferne /IT und nutze einen passenden RunLevel, beachte aber, dass GUI-Programme dann
-    möglicherweise nicht sichtbar oder startbar sind.
-#>
-
 param(
     [string]$Label = "GameDrive",
-    [int]$TimeoutSeconds = 600,
-    [int]$PollIntervalSeconds = 10
+    [switch]$KeepRunning,
+    [int]$PollDelaySeconds = 2
 )
 
 # Feste, hartkodierte Launcher-Pfade (absolute Pfade auf C:\)
-$Launcher1 = 'C:\\Games\\Launcher1.exe'
-$Launcher2 = 'C:\\Games\\Launcher2.exe' 
+$Launcher1 = 'C:\Program Files (x86)\Steam\steam.exe'
+$Launcher2 = 'C:\Program Files\Epic Games\Launcher\Engine\Binaries\Win64\EpicGamesLauncher.exe'
 
 function Find-DriveRootByLabel {
     param([string]$Label)
@@ -54,25 +31,77 @@ function Find-DriveRootByLabel {
     return $null
 }
 
-# Sicherstellen, dass die Launcher auf C:\ vorhanden sind
-if (-not (Test-Path -Path $Launcher1 -PathType Leaf)) { exit 2 }
-if (-not (Test-Path -Path $Launcher2 -PathType Leaf)) { exit 3 }
+function Try-StartIfPresent {
+    param([string]$Label)
 
-$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-
-while ((Get-Date) -lt $deadline) {
     $root = Find-DriveRootByLabel -Label $Label
     if ($root) {
         try {
-            Start-Process -FilePath $Launcher1 -WindowStyle Normal -ErrorAction Stop
-            Start-Process -FilePath $Launcher2 -WindowStyle Normal -ErrorAction Stop
-            exit 0
+            Start-Process -FilePath $Launcher1 -WindowStyle Minimized -ErrorAction Stop
         } catch {
+            Write-Error "Fehler beim Starten von $Launcher1 : $_"
             exit 4
         }
+        try {
+            Start-Process -FilePath $Launcher2 -WindowStyle Minimized -ErrorAction Stop
+        } catch {
+            Write-Error "Fehler beim Starten von $Launcher2 : $_"
+            exit 4
+        }
+        return $true
     }
-    Start-Sleep -Seconds $PollIntervalSeconds
+    return $false
 }
 
-# Timeout: Laufwerk nicht gefunden
-exit 1
+# Sicherstellen, dass die Launcher auf C:\ vorhanden sind
+if (-not (Test-Path -Path $Launcher1 -PathType Leaf)) { Write-Error "Launcher1 nicht gefunden: $Launcher1"; exit 2 }
+if (-not (Test-Path -Path $Launcher2 -PathType Leaf)) { Write-Error "Launcher2 nicht gefunden: $Launcher2"; exit 3 }
+
+# Sofort prüfen (für den Fall, dass die Platte schon eingesteckt ist)
+if (Try-StartIfPresent -Label $Label) {
+    if (-not $KeepRunning) { exit 0 }
+    # wenn KeepRunning, weiterlaufen und weiterhin Events verarbeiten
+}
+
+$sourceId = "GameDrive_VolumeWatcher_$([guid]::NewGuid().ToString())"
+
+try {
+    # Registriere das WMI-Event (Win32_VolumeChangeEvent)
+    Register-WmiEvent -Class Win32_VolumeChangeEvent -SourceIdentifier $sourceId | Out-Null
+    Write-Host "Warte auf Volume-Ereignisse (SourceIdentifier: $sourceId). Label: $Label. KeepRunning: $KeepRunning"
+
+    while ($true) {
+        # Warte auf ein Event (blockierend). Kein Timeout gesetzt -> wartet beliebig lange
+        $ev = Wait-Event -SourceIdentifier $sourceId
+        if ($null -eq $ev) { continue }
+
+        # EventType checken (je nach System: 2 oder 3 können relevante Typen sein)
+        $evtType = $ev.SourceEventArgs.NewEvent.EventType 2>$null
+        Write-Host "Event empfangen. EventType=$evtType"
+
+        # Nur bei Device Arrival / relevante Events prüfen (häufig: 2 = Configuration Changed, 3 = Device Arrival)
+        if ($evtType -in 2,3) {
+            Start-Sleep -Seconds $PollDelaySeconds
+            if (Try-StartIfPresent -Label $Label) {
+                Write-Host "Launcher gestartet (Label gefunden: $Label)."
+                if (-not $KeepRunning) {
+                    # Aufräumen und beenden
+                    Unregister-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue
+                    Remove-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue
+                    exit 0
+                }
+                # wenn KeepRunning, weiter lauschen (Launcher werden bei jedem Event neu gestartet)
+            } else {
+                Write-Host "Label '$Label' nicht gefunden nach Event."
+            }
+        }
+
+        # Aufräumen des lokalen Event-Objekts
+        try { Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue } catch {}
+    }
+}
+finally {
+    # Stelle sicher, dass wir die Subscription entfernen, wenn das Skript endet
+    try { Unregister-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+}
